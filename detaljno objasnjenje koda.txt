@@ -1,0 +1,1807 @@
+Može. Idemo sada **detaljno**, ali još uvijek tako da stvarno razumiješ što se događa, ne samo da čitaš kod.
+
+Imaš tri glavna dijela projekta:
+
+```text
+feature_selectors.py
+run_experiments.py
+plot_results.py
+```
+
+---
+
+# 1. `feature_selectors.py`
+
+Ovaj file je zadužen za **odabir značajki**.
+
+Tu su implementirane wrapper metode:
+
+```text
+SFS
+SBS
+Random wrapper
+```
+
+Znači ovaj file ne učitava datasetove i ne radi grafove. Njegov posao je samo:
+
+> dobiti train i validation podatke, isprobavati podskupove značajki i vratiti najbolji pronađeni podskup.
+
+---
+
+## Importovi
+
+```python
+import time
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+import numpy as np
+from sklearn.base import clone
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+```
+
+Ovdje se koriste:
+
+* `time` za mjerenje trajanja selekcije
+* `dataclass` za uredno spremanje rezultata selekcije
+* `List`, `Optional`, `Tuple` za tipove
+* `numpy` za rad s nizovima
+* `clone` da se svaki put napravi svježa kopija klasifikatora
+* `accuracy_score` i `f1_score` za metrike
+* `Pipeline` i `StandardScaler` za model koji prvo skalira podatke pa trenira klasifikator
+
+---
+
+# `SelectionResult`
+
+```python
+@dataclass
+class SelectionResult:
+    selected_features: List[int]
+    validation_score: float
+    n_evaluated_subsets: int
+    selection_time_sec: float
+```
+
+Ovo je mala klasa koja služi kao “paket rezultata”.
+
+Kada SFS, SBS ili Random završe, vraćaju objekt koji kaže:
+
+```text
+selected_features       koji su featurei odabrani
+validation_score        najbolji rezultat na validation skupu
+n_evaluated_subsets     koliko je podskupova testirano
+selection_time_sec      koliko je trajao odabir značajki
+```
+
+Primjer rezultata može biti:
+
+```text
+selected_features = [2, 5, 9]
+validation_score = 0.91
+n_evaluated_subsets = 120
+selection_time_sec = 0.8
+```
+
+To se kasnije sprema u CSV.
+
+---
+
+# `_make_model(classifier)`
+
+```python
+def _make_model(classifier):
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", clone(classifier)),
+    ])
+```
+
+Ova funkcija napravi model koji ima dva koraka:
+
+```text
+1. StandardScaler
+2. classifier
+```
+
+Dakle, prije treniranja klasifikatora podaci se skaliraju.
+
+To je važno jer koristiš:
+
+```text
+KNN
+SVM
+```
+
+Oba algoritma su osjetljiva na skalu značajki.
+
+Primjer:
+
+Ako jedan feature ima vrijednosti od 0 do 1, a drugi od 0 do 10000, model bi mogao dati preveliku važnost ovom drugom. Skaliranje to rješava.
+
+`clone(classifier)` znači da se svaki put koristi nova, čista kopija klasifikatora. To je bitno jer wrapper puno puta trenira model na različitim subsetima.
+
+---
+
+# `_score_model(...)`
+
+```python
+def _score_model(y_true, y_pred, metric: str) -> float:
+    if metric == "accuracy":
+        return float(accuracy_score(y_true, y_pred))
+    if metric == "macro_f1":
+        return float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    raise ValueError("metric mora biti 'accuracy' ili 'macro_f1'")
+```
+
+Ova funkcija računa metriku.
+
+Može računati:
+
+```text
+accuracy
+macro_f1
+```
+
+Ako je `metric == "accuracy"`, računa se accuracy.
+
+Ako je `metric == "macro_f1"`, računa se macro-F1.
+
+To je važno jer profesor traži da se feature selection radi jednom prema accuracy, a jednom prema F1.
+
+Zato kasnije imaš:
+
+```text
+sfs_accuracy
+sfs_macro_f1
+sbs_accuracy
+sbs_macro_f1
+random_accuracy
+random_macro_f1
+```
+
+---
+
+# `evaluate_subset(...)`
+
+```python
+def evaluate_subset(
+    classifier,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    subset,
+    metric,
+) -> float:
+```
+
+Ovo je jedna od najvažnijih funkcija u cijelom projektu.
+
+Njezin posao je:
+
+> uzmi jedan podskup featurea, treniraj model na train skupu i izmjeri rezultat na validation skupu.
+
+Ovaj dio:
+
+```python
+model = _make_model(classifier)
+```
+
+napravi novi model:
+
+```text
+scaler + classifier
+```
+
+Ovaj dio:
+
+```python
+model.fit(X_train[:, subset], y_train)
+```
+
+trenira model samo na odabranim featureima.
+
+Ako je:
+
+```text
+subset = [0, 3, 7]
+```
+
+onda se koristi samo:
+
+```text
+feature 0
+feature 3
+feature 7
+```
+
+Ovaj dio:
+
+```python
+y_pred = model.predict(X_val[:, subset])
+```
+
+radi predikcije na validation skupu, opet samo s tim featureima.
+
+Na kraju:
+
+```python
+return _score_model(y_val, y_pred, metric)
+```
+
+vrati accuracy ili macro-F1.
+
+Ovo je srce wrapper metode.
+
+Wrapper metoda znači:
+
+> kvaliteta feature subseta ocjenjuje se prema uspješnosti klasifikatora.
+
+---
+
+# `sfs_select(...)`
+
+Ovo je implementacija SFS metode.
+
+SFS znači:
+
+```text
+Sequential Forward Selection
+```
+
+Ideja:
+
+> kreni bez featurea i dodaj featuree jedan po jedan.
+
+---
+
+## Početak SFS-a
+
+```python
+start = time.perf_counter()
+n_features = X_train.shape[1]
+remaining = list(range(n_features))
+current_subset: List[int] = []
+best_score = -np.inf
+best_subset: List[int] = []
+evaluated = 0
+steps = 0
+```
+
+Ovdje se priprema algoritam.
+
+`n_features` je broj featurea.
+
+Ako dataset ima 22 featurea, onda je:
+
+```text
+n_features = 22
+```
+
+`remaining` je lista svih featurea koji još nisu odabrani.
+
+Primjer:
+
+```text
+remaining = [0, 1, 2, 3, ..., 21]
+```
+
+`current_subset` je trenutni skup odabranih featurea. Na početku je prazan:
+
+```text
+current_subset = []
+```
+
+`best_score` je najbolji score dosad. Na početku je minus beskonačno jer još ništa nije testirano.
+
+`evaluated` broji koliko je podskupova značajki testirano.
+
+`steps` broji koliko je puta algoritam stvarno dodao novi feature.
+
+---
+
+## Glavna SFS petlja
+
+```python
+while remaining:
+```
+
+Petlja traje dok još postoje featurei koji se mogu dodati.
+
+---
+
+## Testiranje kandidata
+
+```python
+candidate_results = []
+
+for feat in remaining:
+    candidate_subset = current_subset + [feat]
+    score = evaluate_subset(...)
+    evaluated += 1
+    candidate_results.append((score, candidate_subset, feat))
+```
+
+Ovdje se događa glavni SFS postupak.
+
+Ako je trenutno:
+
+```text
+current_subset = [2]
+remaining = [0, 1, 3, 4]
+```
+
+onda se testiraju kandidati:
+
+```text
+[2, 0]
+[2, 1]
+[2, 3]
+[2, 4]
+```
+
+Za svaki kandidat se računa validation score.
+
+Rezultati se spremaju u listu kao tuple:
+
+```text
+(score, candidate_subset, feat)
+```
+
+Primjer:
+
+```text
+(0.89, [2, 0], 0)
+(0.91, [2, 1], 1)
+(0.86, [2, 3], 3)
+(0.88, [2, 4], 4)
+```
+
+---
+
+## Odabir najboljeg kandidata
+
+```python
+step_best_score, step_best_subset, step_best_feat = max(candidate_results, key=lambda item: item[0])
+```
+
+Ova linija uzima kandidata s najvećim scoreom.
+
+`lambda item: item[0]` znači:
+
+> gledaj prvi element tuplea
+
+A prvi element je score.
+
+Dakle, ako imamo:
+
+```text
+(0.91, [2, 1], 1)
+```
+
+onda je:
+
+```text
+item[0] = 0.91
+```
+
+Zato `max(...)` bira kandidata s najvećim validation scoreom.
+
+---
+
+## Provjera poboljšanja
+
+```python
+if step_best_score > best_score + tol:
+```
+
+Ovdje algoritam pita:
+
+> je li najbolji kandidat u ovom koraku bolji od dosad najboljeg rezultata?
+
+Ako jest, feature se dodaje:
+
+```python
+current_subset = step_best_subset
+remaining.remove(step_best_feat)
+best_score = step_best_score
+best_subset = current_subset.copy()
+steps += 1
+```
+
+Dakle:
+
+* novi trenutni subset postaje najbolji kandidat
+* odabrani feature se miče iz `remaining`
+* sprema se novi najbolji score
+* sprema se novi najbolji subset
+
+Ako nema poboljšanja:
+
+```python
+else:
+    break
+```
+
+SFS staje.
+
+To odgovara profesorovoj napomeni:
+
+> ako nijedan feature više nije dodan, a prošli su svi, onda stajem
+
+---
+
+## Limit koraka
+
+```python
+if max_steps is not None and steps >= max_steps:
+    break
+```
+
+Ovo je opcionalno.
+
+Ako želiš ograničiti SFS da ne ide predugo, možeš zadati `--max-steps`.
+
+Ako je `max_steps=None`, nema limita.
+
+---
+
+## Povrat rezultata
+
+```python
+return SelectionResult(...)
+```
+
+Na kraju SFS vraća:
+
+* odabrane featuree
+* najbolji validation score
+* broj evaluiranih subsetova
+* vrijeme trajanja
+
+---
+
+# `sbs_select(...)`
+
+Ovo je implementacija SBS metode.
+
+SBS znači:
+
+```text
+Sequential Backward Selection
+```
+
+Ideja:
+
+> kreni od svih featurea i uklanjaj featuree jedan po jedan.
+
+---
+
+## Početak SBS-a
+
+```python
+start = time.perf_counter()
+n_features = X_train.shape[1]
+current_subset = list(range(n_features))
+best_score = evaluate_subset(..., current_subset, metric)
+best_subset = current_subset.copy()
+evaluated = 1
+steps = 0
+```
+
+Za razliku od SFS-a, SBS ne kreće od praznog skupa.
+
+Kreće od svih featurea.
+
+Ako dataset ima 22 featurea:
+
+```text
+current_subset = [0, 1, 2, ..., 21]
+```
+
+Odmah se računa score s punim skupom featurea:
+
+```python
+best_score = evaluate_subset(... current_subset ...)
+```
+
+Zato je `evaluated = 1`, jer je jedan subset već testiran.
+
+---
+
+## Glavna SBS petlja
+
+```python
+while len(current_subset) > 1:
+```
+
+Petlja traje dok ima više od jednog featurea.
+
+Ne ide ispod 1 featurea jer model mora imati barem jedan ulaz.
+
+---
+
+## Testiranje uklanjanja svakog featurea
+
+```python
+candidate_results = []
+
+for feat in current_subset:
+    candidate_subset = [f for f in current_subset if f != feat]
+    score = evaluate_subset(...)
+    evaluated += 1
+    candidate_results.append((score, candidate_subset, feat))
+```
+
+Ako je trenutni subset:
+
+```text
+[0, 1, 2, 3]
+```
+
+onda SBS testira:
+
+```text
+makni 0 -> [1, 2, 3]
+makni 1 -> [0, 2, 3]
+makni 2 -> [0, 1, 3]
+makni 3 -> [0, 1, 2]
+```
+
+Za svaki od tih podskupova računa validation score.
+
+---
+
+## Odabir najboljeg uklanjanja
+
+```python
+step_best_score, step_best_subset, removed_feat = max(candidate_results, key=lambda item: item[0])
+```
+
+Bira ono uklanjanje koje daje najbolji validation score.
+
+Ako je najbolji rezultat dobiven kada se makne feature 2, onda se feature 2 uklanja.
+
+---
+
+## Provjera poboljšanja
+
+```python
+if step_best_score > best_score + tol:
+```
+
+Ako uklanjanje poboljšava rezultat, prihvati ga:
+
+```python
+current_subset = step_best_subset
+best_score = step_best_score
+best_subset = current_subset.copy()
+steps += 1
+```
+
+Ako nijedno uklanjanje ne poboljša rezultat:
+
+```python
+else:
+    break
+```
+
+SBS staje.
+
+Zato SBS često zadržava puno featurea. Ako uklanjanje ne pomaže, neće uklanjati samo da bi smanjio broj featurea.
+
+---
+
+# `random_select(...)`
+
+Ovo je random wrapper metoda.
+
+Ideja:
+
+> slučajno generiraj više različitih podskupova featurea i vrati onaj koji daje najbolji validation score.
+
+---
+
+## Početak
+
+```python
+start = time.perf_counter()
+rng = np.random.default_rng(random_state)
+n_features = X_train.shape[1]
+```
+
+`rng` je generator slučajnih brojeva.
+
+`random_state` omogućuje reproducibilnost. To znači da možeš ponoviti isti eksperiment i dobiti iste random subsetove.
+
+---
+
+## Raspon broja featurea
+
+```python
+if max_features is None:
+    max_features = n_features
+
+min_features = max(1, min(min_features, n_features))
+max_features = max(min_features, min(max_features, n_features))
+```
+
+Ovo osigurava da random subset ima barem jedan feature i najviše sve featuree.
+
+Ako dataset ima 22 featurea, random može odabrati:
+
+```text
+1 do 22 featurea
+```
+
+---
+
+## Praćenje najboljeg subseta
+
+```python
+best_score = -np.inf
+best_subset: List[int] = []
+evaluated = 0
+seen = set()
+```
+
+`seen` pamti već generirane subsetove, da se isti subset ne testira više puta.
+
+---
+
+## Glavna random petlja
+
+```python
+while evaluated < n_trials and attempts < max_unique_attempts:
+```
+
+Petlja traje dok nije evaluirano dovoljno random subsetova.
+
+Ako je `n_trials = 484`, random pokušava evaluirati 484 različita subseta.
+
+Kod `n2` pravila:
+
+```text
+n_trials = n_features * n_features
+```
+
+Primjeri:
+
+```text
+Parkinsons: 22 featurea -> 22*22 = 484 random subseta
+Ionosphere: 34 featurea -> 34*34 = 1156 random subsetova
+```
+
+---
+
+## Generiranje random subseta
+
+```python
+k = int(rng.integers(min_features, max_features + 1))
+subset = sorted(rng.choice(n_features, size=k, replace=False).tolist())
+```
+
+Prvo se slučajno odabere broj featurea `k`.
+
+Primjer:
+
+```text
+k = 5
+```
+
+Onda se slučajno odabere 5 različitih featurea.
+
+Primjer:
+
+```text
+subset = [1, 4, 7, 13, 20]
+```
+
+`replace=False` znači da se isti feature ne može izabrati dvaput.
+
+---
+
+## Izbjegavanje duplikata
+
+```python
+subset_key = tuple(subset)
+
+if subset_key in seen:
+    continue
+
+seen.add(subset_key)
+```
+
+Ako je isti subset već testiran, preskoči ga.
+
+---
+
+## Evaluacija subseta
+
+```python
+score = evaluate_subset(...)
+evaluated += 1
+```
+
+Kao i kod SFS/SBS, model se trenira na train skupu i mjeri na validation skupu.
+
+---
+
+## Spremanje najboljeg random subseta
+
+```python
+if score > best_score:
+    best_score = score
+    best_subset = subset
+```
+
+Ako je novi subset bolji od svih ranijih, sprema se kao najbolji.
+
+---
+
+# 2. `run_experiments.py`
+
+Ovo je glavni file projekta.
+
+On organizira cijeli eksperiment.
+
+Njegov posao je:
+
+```text
+učitaj podatke
+podijeli podatke
+pokreni klasifikatore
+pokreni metode selekcije
+testiraj rezultate
+spremi CSV
+napravi summary
+```
+
+---
+
+## Importovi
+
+```python
+import argparse
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple
+```
+
+* `argparse` omogućuje argumente iz terminala
+* `time` mjeri trajanje
+* `Path` radi s mapama
+* tipovi služe za čitljivost
+
+```python
+import numpy as np
+import pandas as pd
+```
+
+* `numpy` za matrice
+* `pandas` za CSV i tablice
+
+```python
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+```
+
+Ovdje se koriste:
+
+* `train_test_split` za train/validation/test podjelu
+* KNN
+* SVM
+
+```python
+from feature_selectors import random_select, sbs_select, sfs_select
+```
+
+Ovdje se uvoze tvoje wrapper metode.
+
+---
+
+# Globalne mape
+
+```python
+RESULTS_DIR = Path("results")
+DATASETS_DIR = Path("datasets")
+```
+
+Rezultati idu u:
+
+```text
+results/
+```
+
+Datasetovi se čitaju iz:
+
+```text
+datasets/
+```
+
+---
+
+# `build_classifiers()`
+
+```python
+def build_classifiers() -> Dict[str, object]:
+    return {
+        "knn5": KNeighborsClassifier(n_neighbors=5),
+        "svm_rbf": SVC(kernel="rbf", C=1.0, gamma="scale"),
+    }
+```
+
+Ovdje definiraš klasifikatore.
+
+Imaš dva:
+
+```text
+knn5
+svm_rbf
+```
+
+## KNN-5
+
+KNN klasificira novi primjer prema najbližim susjedima.
+
+`n_neighbors=5` znači da gleda 5 najbližih susjeda.
+
+## SVM RBF
+
+SVM s RBF kernelom može modelirati nelinearne granice odlučivanja.
+
+Ovo je dobar izbor jer se razlikuje od KNN-a.
+
+---
+
+# `load_csv_dataset(...)`
+
+Ova funkcija učitava jedan CSV dataset.
+
+```python
+df = pd.read_csv(path)
+```
+
+Učita CSV u pandas DataFrame.
+
+---
+
+## Target stupac
+
+```python
+if target_column is None:
+    target_column = df.columns[-1]
+```
+
+Ako korisnik nije naveo target stupac, uzima se zadnji stupac.
+
+Zato tvoji datasetovi moraju imati:
+
+```text
+feature1, feature2, ..., target
+```
+
+gdje je `target` zadnji.
+
+---
+
+## Odvajanje X i y
+
+```python
+y_raw = df[target_column]
+X_df = df.drop(columns=[target_column])
+```
+
+`y_raw` je ciljna klasa.
+
+`X_df` su featurei.
+
+---
+
+## Micanje ID/name stupaca
+
+```python
+for col in list(X_df.columns):
+    if X_df[col].dtype == object and X_df[col].nunique() > 0.8 * len(X_df):
+        X_df = X_df.drop(columns=[col])
+```
+
+Ako postoji tekstualni stupac koji ima skoro sve vrijednosti različite, vrlo vjerojatno je to ID ili naziv uzorka.
+
+Primjer kod Parkinsonsa:
+
+```text
+name
+```
+
+To nije pravi feature, pa se uklanja.
+
+Ti si ga već ručno maknuo, ali kod svejedno ima zaštitu.
+
+---
+
+## Pretvaranje kategorijskih featurea
+
+```python
+X_df = pd.get_dummies(X_df, drop_first=False)
+```
+
+Ako neki feature nije numerički nego kategorijski, pretvara se u dummy stupce.
+
+Primjer:
+
+```text
+boja = red/blue/green
+```
+
+postaje:
+
+```text
+boja_red
+boja_blue
+boja_green
+```
+
+Za tvoje trenutne datasetove ovo nije jako bitno jer su featurei numerički.
+
+---
+
+## Missing i infinite vrijednosti
+
+```python
+X_df = X_df.replace([np.inf, -np.inf], np.nan)
+X_df = X_df.apply(pd.to_numeric, errors="coerce")
+X_df = X_df.fillna(X_df.median(numeric_only=True))
+```
+
+Ovo čisti podatke.
+
+Radi:
+
+* beskonačne vrijednosti pretvara u NaN
+* sve pokušava pretvoriti u brojeve
+* missing vrijednosti popunjava medianom
+
+To je praktično jer UCI datasetovi znaju imati čudne vrijednosti.
+
+---
+
+## Pretvaranje u numpy
+
+```python
+X = X_df.to_numpy(dtype=float)
+y = LabelEncoder().fit_transform(y_raw.astype(str))
+```
+
+`X` postaje numerička matrica.
+
+`y` se pretvara u brojeve.
+
+Ako klase pišu:
+
+```text
+g, b
+```
+
+LabelEncoder ih pretvori u:
+
+```text
+0, 1
+```
+
+---
+
+## Provjera binarne klasifikacije
+
+```python
+if len(np.unique(y)) != 2:
+    raise ValueError(...)
+```
+
+Ovo osigurava da dataset ima točno dvije klase.
+
+To je važno jer si odlučio koristiti strogo binarne datasetove.
+
+Ako ubaciš Iris ili Wine bez binarizacije, kod će javiti grešku.
+
+---
+
+# `load_all_datasets(...)`
+
+Ova funkcija učitava sve datasetove koje zadaš.
+
+Ako pokreneš:
+
+```bash
+--datasets parkinsons,ionosphere
+```
+
+onda učitava:
+
+```text
+datasets/parkinsons.csv
+datasets/ionosphere.csv
+```
+
+Ako ne zadaš ništa, učitava sve CSV fileove iz mape `datasets`.
+
+Na kraju vraća dictionary:
+
+```text
+{
+  "parkinsons": (X, y, feature_names),
+  "ionosphere": (X, y, feature_names)
+}
+```
+
+---
+
+# `split_train_val_test(...)`
+
+Ovo je jedan od najvažnijih dijelova cijelog eksperimenta.
+
+Profesor je tražio:
+
+```text
+50% train
+25% validation
+25% test
+```
+
+Funkcija to radi u dva koraka.
+
+---
+
+## Prvi split
+
+```python
+X_train_val, X_test, y_train_val, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.25,
+    stratify=y,
+    random_state=random_state,
+)
+```
+
+Ovdje se odvaja test skup.
+
+Dobiješ:
+
+```text
+75% train_val
+25% test
+```
+
+`stratify=y` znači da se čuva omjer klasa.
+
+---
+
+## Drugi split
+
+```python
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train_val,
+    y_train_val,
+    test_size=1 / 3,
+    stratify=y_train_val,
+    random_state=random_state + 10000,
+)
+```
+
+Sada se onih 75% dijeli na train i validation.
+
+Od 75%, jedna trećina je 25% ukupnog dataseta.
+
+Zato na kraju dobiješ:
+
+```text
+50% train
+25% validation
+25% test
+```
+
+---
+
+# `make_final_model(classifier)`
+
+```python
+return Pipeline([
+    ("scaler", StandardScaler()),
+    ("clf", clone(classifier)),
+])
+```
+
+Ovo je isto kao `_make_model` u `feature_selectors.py`.
+
+Radi finalni model za testiranje.
+
+Sadrži:
+
+```text
+StandardScaler + classifier
+```
+
+---
+
+# `evaluate_on_test(...)`
+
+```python
+def evaluate_on_test(classifier, X_train_final, y_train_final, X_test, y_test, selected_features):
+```
+
+Ova funkcija trenira finalni model i testira ga na test skupu.
+
+Koristi samo odabrane featuree.
+
+```python
+model.fit(X_train_final[:, selected_features], y_train_final)
+```
+
+Trenira na:
+
+```text
+train + validation
+```
+
+```python
+y_pred = model.predict(X_test[:, selected_features])
+```
+
+Testira na:
+
+```text
+test
+```
+
+Zatim vraća:
+
+```text
+test_accuracy
+test_macro_f1
+```
+
+Ovo je konačna evaluacija.
+
+---
+
+# `resolve_random_trials(...)`
+
+```python
+if value == "n2":
+    return n_features * n_features
+return int(value)
+```
+
+Ako u terminalu napišeš:
+
+```bash
+--random-trials n2
+```
+
+onda broj random subsetova postaje:
+
+```text
+n_features * n_features
+```
+
+Ako napišeš:
+
+```bash
+--random-trials 100
+```
+
+onda koristi 100 random subsetova.
+
+---
+
+# `run_one_split(...)`
+
+Ovo je najvažnija funkcija u `run_experiments.py`.
+
+Ona radi jedan kompletan eksperiment za:
+
+```text
+jedan dataset
+jedan classifier
+jedan split
+```
+
+Dakle primjer:
+
+```text
+dataset = ionosphere
+classifier = knn5
+split = 7
+```
+
+Unutra se za taj slučaj rade:
+
+```text
+baseline
+SFS accuracy
+SFS macro-F1
+SBS accuracy
+SBS macro-F1
+Random accuracy
+Random macro-F1
+```
+
+---
+
+## Random state
+
+```python
+random_state = base_seed + split_id
+```
+
+Svaki split ima drugačiji random seed, zato dobiješ 30 različitih podjela.
+
+---
+
+## Split podataka
+
+```python
+X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(...)
+```
+
+Ovdje se radi 50/25/25 podjela.
+
+---
+
+## Train + validation za finalni model
+
+```python
+X_train_final = np.vstack([X_train, X_val])
+y_train_final = np.concatenate([y_train, y_val])
+```
+
+Nakon što wrapper odabere featuree, finalni model se trenira na train + validation.
+
+To je ispravno jer:
+
+* validation je korišten za izbor featurea
+* ali finalni model može iskoristiti sve podatke osim testa
+
+Test ostaje netaknut do kraja.
+
+---
+
+# Baseline dio
+
+```python
+all_features = list(range(n_features))
+test_scores = evaluate_on_test(... all_features)
+```
+
+Baseline koristi sve featuree.
+
+Nema selekcije.
+
+Zato:
+
+```text
+selected_features = svi featurei
+n_evaluated_subsets = 0
+validation_score = NaN
+```
+
+Baseline se trenira na train+validation i testira na test skupu.
+
+---
+
+# Wrapper jobs
+
+```python
+selection_jobs = [
+    ("sfs", "accuracy"),
+    ("sfs", "macro_f1"),
+    ("sbs", "accuracy"),
+    ("sbs", "macro_f1"),
+    ("random", "accuracy"),
+    ("random", "macro_f1"),
+]
+```
+
+Ovdje je točno definirano što se pokreće.
+
+Svaka metoda se izvodi dvaput:
+
+```text
+jednom prema accuracy
+jednom prema macro_f1
+```
+
+To je direktno prema profesorovoj uputi.
+
+---
+
+## Pokretanje odgovarajuće metode
+
+```python
+if method == "sfs":
+    result = sfs_select(...)
+elif method == "sbs":
+    result = sbs_select(...)
+elif method == "random":
+    result = random_select(...)
+```
+
+Ako je metoda SFS, poziva se `sfs_select`.
+
+Ako je SBS, poziva se `sbs_select`.
+
+Ako je random, poziva se `random_select`.
+
+Sve tri metode vraćaju `SelectionResult`.
+
+---
+
+## Ako selector ne vrati featuree
+
+```python
+selected = result.selected_features
+if not selected:
+    selected = all_features
+```
+
+Ovo je sigurnosna zaštita.
+
+Ako iz nekog razloga metoda ne odabere nijedan feature, koristi se sve featuree.
+
+---
+
+## Testiranje odabranog subseta
+
+```python
+test_scores = evaluate_on_test(... selected)
+```
+
+Nakon što je wrapper odabrao featuree, finalni model se trenira na train+validation i testira na test skupu.
+
+Ovo je vrlo bitno:
+
+> validation služi za izbor featurea, test služi za konačnu procjenu.
+
+---
+
+## Spremanje reda rezultata
+
+Za svaku metodu sprema se red koji sadrži:
+
+```text
+dataset
+classifier
+split
+method
+selection_metric
+validation_score
+test_accuracy
+test_macro_f1
+n_selected
+selected_features
+n_evaluated_subsets
+time_sec
+```
+
+To kasnije postaje `all_results.csv`.
+
+---
+
+# `summarize_results(...)`
+
+Ova funkcija radi sažetak rezultata.
+
+Grupira po:
+
+```text
+dataset
+classifier
+method
+selection_metric
+```
+
+I računa:
+
+```text
+accuracy_mean
+accuracy_std
+accuracy_min
+accuracy_max
+
+macro_f1_mean
+macro_f1_std
+macro_f1_min
+macro_f1_max
+
+n_selected_mean
+n_selected_std
+n_selected_min
+n_selected_max
+
+time_mean_sec
+time_std_sec
+
+subsets_mean
+```
+
+To je tvoja deskriptivna statistika.
+
+Profesor je tražio:
+
+```text
+prosjek
+standardna devijacija
+min
+max
+```
+
+i to ovdje dobivaš.
+
+---
+
+# `parse_args()`
+
+Ovdje su argumenti za terminal.
+
+Najvažniji:
+
+```bash
+--datasets parkinsons,ionosphere
+```
+
+bira datasetove.
+
+```bash
+--classifiers knn5,svm_rbf
+```
+
+bira klasifikatore.
+
+```bash
+--splits 30
+```
+
+broj ponavljanja.
+
+```bash
+--random-trials n2
+```
+
+random wrapper koristi n² subsetova.
+
+```bash
+--random-min-features 1
+```
+
+random subset ima barem 1 feature.
+
+```bash
+--max-steps
+```
+
+opcionalni limit za SFS/SBS.
+
+---
+
+# `main()`
+
+Ovo je glavni tijek programa.
+
+Kad pokreneš:
+
+```bash
+python run_experiments.py --datasets parkinsons,ionosphere --classifiers knn5,svm_rbf --splits 30 --random-trials n2
+```
+
+program radi:
+
+1. pročita argumente
+2. napravi mapu `results`
+3. učita datasetove
+4. učita klasifikatore
+5. ispiše informacije
+6. prolazi kroz svaki dataset
+7. prolazi kroz svaki klasifikator
+8. prolazi kroz svaki split
+9. pokreće `run_one_split`
+10. sprema parcijalne rezultate
+11. sprema sve rezultate
+12. računa summary
+13. ispisuje summary
+
+---
+
+## Parcijalno spremanje
+
+```python
+pd.DataFrame(all_rows).to_csv(RESULTS_DIR / "all_results_partial.csv", index=False)
+```
+
+Ovo je korisno kod dugih eksperimenata.
+
+Ako program pukne nakon 20 splitova, imaš barem parcijalne rezultate.
+
+---
+
+# 3. `plot_results.py`
+
+Ovaj file samo crta grafove.
+
+Ne trenira modele i ne bira featuree.
+
+---
+
+## Putanje
+
+```python
+RESULTS_DIR = Path("results")
+SUMMARY_PATH = RESULTS_DIR / "summary_results.csv"
+```
+
+Očekuje da postoji:
+
+```text
+results/summary_results.csv
+```
+
+To nastaje nakon pokretanja `run_experiments.py`.
+
+---
+
+# `method_label(row)`
+
+```python
+def method_label(row):
+    if row["method"] == "baseline":
+        return "baseline"
+    return f"{row['method']}_{row['selection_metric']}"
+```
+
+Ovo pravi nazive metoda za graf.
+
+Ako je baseline, labela je:
+
+```text
+baseline
+```
+
+Ako je SFS s accuracy:
+
+```text
+sfs_accuracy
+```
+
+Ako je SFS s macro-F1:
+
+```text
+sfs_macro_f1
+```
+
+Isto za SBS i random.
+
+---
+
+# `plot_bar(...)`
+
+Ova funkcija crta jedan bar chart.
+
+Prima:
+
+```text
+dataset
+classifier
+column
+ylabel
+filename_prefix
+```
+
+Primjer:
+
+```python
+plot_bar(df, "ionosphere", "knn5", "accuracy_mean", "Accuracy mean", "accuracy")
+```
+
+To napravi graf accuracyja za:
+
+```text
+dataset = ionosphere
+classifier = knn5
+```
+
+---
+
+## Filtriranje podataka
+
+```python
+subset = df[(df["dataset"] == dataset) & (df["classifier"] == classifier)].copy()
+```
+
+Uzima samo redove za konkretan dataset i konkretan klasifikator.
+
+---
+
+## Crtanje
+
+```python
+plt.bar(subset["label"], subset[column])
+```
+
+Na x-osi su metode:
+
+```text
+baseline
+random_accuracy
+random_macro_f1
+sbs_accuracy
+...
+```
+
+Na y-osi je vrijednost koju crtaš, npr. accuracy mean.
+
+---
+
+## Spremanje slike
+
+```python
+out = RESULTS_DIR / f"{filename_prefix}_{dataset}_{classifier}.png"
+plt.savefig(out, dpi=150)
+```
+
+Graf se sprema u `results/`.
+
+Primjer:
+
+```text
+accuracy_ionosphere_knn5.png
+```
+
+---
+
+# `main()` u plot fileu
+
+```python
+df = pd.read_csv(SUMMARY_PATH)
+```
+
+Učita summary rezultate.
+
+Zatim za svaki dataset i klasifikator crta četiri grafa:
+
+```text
+accuracy
+macro_f1
+broj odabranih featurea
+vrijeme izvođenja
+```
+
+To je dovoljno za eksperimentalni dio rada.
+
+---
+
+# Kako se sve povezuje
+
+Cijeli projekt radi ovako:
+
+```text
+datasets/parkinsons.csv
+datasets/ionosphere.csv
+        ↓
+run_experiments.py
+        ↓
+feature_selectors.py bira featuree
+        ↓
+rezultati se spremaju u results/
+        ↓
+plot_results.py crta grafove
+```
+
+---
+
+# Najvažniji eksperimentalni protokol
+
+Za svaki dataset i klasifikator:
+
+```text
+30 puta:
+    napravi stratified train/validation/test split
+    baseline koristi sve featuree
+    SFS bira featuree na validation skupu
+    SBS bira featuree na validation skupu
+    random bira featuree na validation skupu
+    finalni model se trenira na train+validation
+    testira se na test skupu
+```
+
+---
+
+# Zašto je ovo metodološki ispravno?
+
+Zato što test skup nije korišten za izbor featurea.
+
+Da si featuree birao na test skupu, rezultat bi bio pristran.
+
+Kod tebe:
+
+```text
+train      → treniranje kandidata
+validation → izbor featurea
+test       → konačna evaluacija
+```
+
+To je čisto i obranjivo.
+
+---
+
+# Što je u kodu posebno važno za profesora?
+
+## 1. Stratify
+
+Čuva omjer klasa.
+
+Važno kod Parkinsonsa jer je neuravnotežen:
+
+```text
+klasa 0: 48
+klasa 1: 147
+```
+
+---
+
+## 2. 30 splitova
+
+Ne oslanjaš se na jednu slučajnu podjelu.
+
+Zato računaš:
+
+```text
+mean
+std
+min
+max
+```
+
+---
+
+## 3. Dvije metrike
+
+Koristiš:
+
+```text
+accuracy
+macro-F1
+```
+
+Accuracy može biti varljiva kod neuravnoteženih podataka.
+
+Macro-F1 bolje pokazuje ponašanje po klasama.
+
+---
+
+## 4. Random wrapper
+
+Random metoda generira slučajne subsetove i bira najbolji po validation scoreu.
+
+To je wrapper jer se subseti ocjenjuju pomoću modela.
+
+---
+
+## 5. Scaling
+
+KNN i SVM trebaju skaliranje.
+
+Zato svaki model ima:
+
+```text
+StandardScaler + classifier
+```
+
+---
+
+# Najkraće objašnjenje za usmeno
+
+> Kod se sastoji od tri dijela. `feature_selectors.py` implementira SFS, SBS i random wrapper metode koje odabiru značajke prema validation rezultatu klasifikatora. `run_experiments.py` učitava binarne datasetove, radi 30 stratificiranih train/validation/test podjela u omjeru 50/25/25, pokreće KNN i SVM klasifikatore te sprema rezultate. `plot_results.py` iz sažetih rezultata crta grafove za accuracy, macro-F1, broj odabranih značajki i vrijeme izvođenja. Test skup se koristi isključivo za konačnu evaluaciju, a ne za odabir značajki.
